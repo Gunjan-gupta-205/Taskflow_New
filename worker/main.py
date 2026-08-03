@@ -38,6 +38,10 @@ BASE_BACKOFF_SECONDS = 2  # Base delay used for exponential backoff
 STUCK_TASK_TIMEOUT_SECONDS = 30  # If a task sits in PROCESSING longer than this, assume the worker crashed
 REAPER_INTERVAL_SECONDS = 15     # How often the reaper checks for stuck tasks
 
+DELAYED_QUEUE_KEY = "queue:delayed"  # Redis sorted set holding tasks waiting out their backoff delay
+DELAY_CHECK_INTERVAL_SECONDS = 1     # How often we check for delayed tasks whose wait time is up
+
+
 
 def compute_backoff_delay(retry_count: int) -> float:
     """
@@ -149,6 +153,32 @@ def reap_stuck_tasks():
         finally:
             db.close()
 
+def promote_delayed_tasks():
+    """
+    Runs in its own background thread, checking every second for tasks whose backoff
+    delay has finished. This replaces time.sleep(delay) - instead of the worker loop
+    freezing, a failed task is parked in a Redis sorted set (score = when it should
+    become available again), and this thread moves it back into its real queue once
+    that time passes - without ever blocking the main loop.
+    """
+    while True:
+        time.sleep(DELAY_CHECK_INTERVAL_SECONDS)
+        now = time.time()
+        due_task_ids = redis_client.zrangebyscore(DELAYED_QUEUE_KEY, 0, now)
+
+        for task_id in due_task_ids:
+            removed = redis_client.zrem(DELAYED_QUEUE_KEY, task_id)
+            if not removed:
+                continue
+            db = SessionLocal()
+            try:
+                task = db.query(Task).filter(Task.id == task_id).first()
+                if task:
+                    queue_name = f"queue:{task.priority.lower()}"
+                    redis_client.lpush(queue_name, task_id)
+                    print(f"⏰ Backoff delay finished for task [{task_id}] - moved back into {queue_name}")
+            finally:
+                db.close()
 
 def process_tasks():
     print("👷 Advanced Worker started. Waiting for tasks...")
@@ -206,13 +236,14 @@ def process_tasks():
                         redis_client.lpush("queue:dead", task.id)
                         send_dlq_alert(task)
                     else:
+                        
                         delay = compute_backoff_delay(task.retry_count)
-                        print(f"🔄 Re-queueing task for Retry {task.retry_count + 1} after {delay}s backoff...")
+                        print(f"⏳ Scheduling task for Retry {task.retry_count + 1} in {delay}s (non-blocking)")
                         task.status = "PENDING"
                         task.started_at = None
                         db.commit()
-                        time.sleep(delay)  # Exponential backoff before it becomes available again
-                        redis_client.lpush(queue_name, task.id)
+                        available_at = time.time() + delay
+                        redis_client.zadd(DELAYED_QUEUE_KEY, {task.id: available_at})
 
                     db.commit()
 
@@ -228,5 +259,9 @@ if __name__ == "__main__":
     # Start the reaper in a background thread so it runs alongside the main processing loop
     reaper_thread = threading.Thread(target=reap_stuck_tasks, daemon=True)
     reaper_thread.start()
+
+    # Start the delayed-task promoter - this is what makes retry backoff non-blocking
+    promoter_thread = threading.Thread(target=promote_delayed_tasks, daemon=True)
+    promoter_thread.start()
 
     process_tasks()
